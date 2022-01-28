@@ -264,23 +264,27 @@ BigInteger operator*(const BigInteger &first, const BigInteger &second) {
 }
 
 BigInteger operator-(const BigInteger &first, const BigInteger &second) {
-    BigInteger result = first;
-    return result -= second;
+    BigInteger result(first);
+    result -= second;
+    return result;
 }
 
 BigInteger operator+(const BigInteger &first, const BigInteger &second) {
-    BigInteger result = first;
-    return result += second;
+    BigInteger result(first);
+    result += second;
+    return result;
 }
 
 BigInteger operator/(const BigInteger &first, const BigInteger &second) {
-    BigInteger result = first;
-    return result /= second;
+    BigInteger result(first);
+    result /= second;
+    return result;
 }
 
 BigInteger operator%(const BigInteger &first, const BigInteger &second) {
-    BigInteger result = first;
-    return result %= second;
+    BigInteger result(first);
+    result %= second;
+    return result;
 }
 
 BigInteger &BigInteger::operator*=(const BigInteger &other) {
@@ -498,4 +502,3 @@ bool operator<=(const Rational &first, const Rational &second) {
 bool operator>=(const Rational &first, const Rational &second) {
     return !(first < second);
 }
-

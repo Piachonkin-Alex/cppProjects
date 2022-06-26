@@ -1,271 +1,427 @@
-#pragma once
+#include <algorithm>
+#include <cstddef>
+#include <new>
 
-template<typename T>
-class List {
+template<size_t N>
+class alignas(std::max_align_t) StackStorage {
 private:
-    struct Node {  // часть листа, где лежат указатели на прошлый и след элемент и указатель на
-        // значение
-    public:
-        T *value;
-        Node *pre;
-        Node *next;
-
-        Node() = default;
-
-        Node(Node *pre, Node *next) : value(nullptr), pre(pre), next(next) {};
-
-        Node(Node *pre, Node *next, const T &val) : pre(pre), next(next) {  // копирования
-            value = new T(val);
-        }
-
-        Node(Node *pre, Node *next, T &&val) : pre(pre), next(next) {  // перемещения
-            value = new T(std::move(val));
-        }
-    };
-
-    template<typename... Args>
-    void Emplace(Node *node, Args &&... args) {
-        ++size_;
-        Node *construct_node = new Node(nullptr, node);
-        construct_node->value = new T(std::forward<Args>(args)...);
-        if (node->pre == nullptr) {
-            first_->pre = construct_node;
-            first_ = construct_node;
-            return;
-        }
-        construct_node->pre = node->pre;
-        construct_node->next = node;
-        node->pre->next = construct_node;
-        node->pre = construct_node;
-    }
-
-    template<typename U = T>
-    Node *Insert(Node *node, U &&value) {
-        Emplace(node, std::forward<U>(value));
-        return node->pre;
-    }
-
-    Node *Erase(Node *node) {
-        if (size_ == 0) {
-            throw 1;
-        }
-        --size_;
-        if (node == first_) {
-            Node *new_tail = first_->next;
-            new_tail->pre = nullptr;
-            delete first_->value;
-            delete first_;
-            first_ = new_tail;
-            return first_;
-        }
-        Node *ret_node = node->next;
-        ret_node->pre = node->pre;
-        node->pre->next = ret_node;
-        delete node->value;
-        delete node;
-        return ret_node;
-    }
-
-    size_t size_;
-    Node *first_;
-    Node *last_;
-    Node *fake_;
+    char memory_[N]{};
+    size_t current_ = 0;
 
 public:
+    StackStorage() = default;
+
+    void *allocate(size_t size, size_t align) {
+        size_t next = (current_ + align - 1) / align * align;
+        if (N < next + size) {
+            throw std::bad_alloc();
+        }
+        current_ = next + size;
+        return memory_ + next;
+    }
+};
+
+
+template<typename T, size_t N>
+class StackAllocator {
+private:
+    StackStorage<N> &storage_;
+public:
+    template<typename T1, typename T2, size_t N1, size_t N2>
+    friend bool operator==(const StackAllocator<T1, N1> &lhs, const StackAllocator<T2, N2> &rhs) noexcept;
+
+    template<typename U>
+    struct rebind {
+        using other = StackAllocator<U, N>;
+    };
+
+    using value_type = T;
+
+    StackAllocator(StackStorage<N> &stack) noexcept: storage_(stack) {}
+
+    StackStorage<N> &stack() const {
+        return storage_;
+    }
+
+    template<typename U>
+    StackAllocator(const StackAllocator<U, N> &other) noexcept: storage_(other.stack()) {}
+
+    StackAllocator &operator=(const StackAllocator &other) noexcept {
+        storage_ = other.storage_;
+        return *this;
+    }
+
+    T *allocate(size_t n) {
+        return reinterpret_cast<T *>(storage_.allocate(n * sizeof(T), alignof(T)));
+    }
+
+    void deallocate(T *, size_t) {}
+};
+
+
+template<typename T1, typename T2, size_t N1, size_t N2>
+bool operator==(const StackAllocator<T1, N1> &lhs, const StackAllocator<T2, N2> &rhs) noexcept {
+    return &lhs.storage_ == &rhs.storage_;
+}
+
+template<typename T, typename Alloc = std::allocator<T>>
+class List {
+private:
+    struct BaseNode {
+        BaseNode *prev;
+        BaseNode *next;
+
+        BaseNode(BaseNode *prev, BaseNode *next) : prev(prev), next(next) {};
+
+        BaseNode() : prev(this), next(this) {}
+
+
+        void makeSwap(BaseNode &other) {
+            if (other.next == &other) {
+                prev = this, next = this;
+                return;
+            }
+            prev = other.prev, next = other.next;
+            prev->next = this, next->prev = this;
+        }
+    };
+
+    struct Node : BaseNode {
+        T value;
+
+
+        Node(T &&value, BaseNode *prev = nullptr, BaseNode *next = nullptr) : BaseNode(prev, next),
+                                                                              value(std::move(value)) {}
+
+        Node(const T &value, BaseNode *prev = nullptr, BaseNode *next = nullptr) : BaseNode(prev, next),
+                                                                                   value(value) {}
+
+        template<typename... Args>
+        Node(Args &&... args): BaseNode(nullptr, nullptr),
+                               value(std::forward<Args>(args)...) {};
+
+        Node() : value() {}
+    };
+
+    using NodeAllocTraits = std::allocator_traits<typename std::allocator_traits<Alloc>::template rebind_alloc<Node>>;
+    typename std::allocator_traits<Alloc>::template rebind_alloc<Node> alloc_;
+    size_t sz_ = 0;
+    BaseNode fake_node_;
+
+public:
+
     template<bool IsConst>
-    class MyIterator {
+    class CommonIter {
     private:
-        Node *ptr_;
+        BaseNode *node_;
+
 
     public:
-        using iterator_category = std::bidirectional_iterator_tag;   // NOLINT
-        using value_type = std::conditional_t<IsConst, const T, T>;  // NOLINT
-        using reference = value_type &;                               // NOLINT
-        using pointer = value_type *;                                 // NOLINT
-        using difference_type = int;                                 // NOLINT
+        using difference_type = long long;
+        using value_type = typename std::conditional<IsConst, const T, T>::type;
+        using pointer = typename std::conditional<IsConst, const T *, T *>::type;
+        using reference = typename std::conditional<IsConst, const T &, T &>::type;
+        using iterator_category = std::bidirectional_iterator_tag;
 
-        explicit MyIterator(Node *ptr) : ptr_(ptr) {
+        CommonIter() = default;
+
+        explicit CommonIter(const BaseNode *node) : node_(const_cast<BaseNode *>(node)) {};
+
+
+        CommonIter(const CommonIter &other) : node_(other.node_) {};
+
+        operator CommonIter<true>() const {
+            return CommonIter<true>(node_);
         }
 
-        MyIterator(const MyIterator<false> &other) : ptr_(other.ptr_) {
+        CommonIter &operator=(const CommonIter &other) = default;
+
+        reference operator*() {
+            return static_cast<Node *>(node_)->value;
         }
 
-        MyIterator<IsConst> &operator=(const MyIterator<IsConst> &other) {
-            ptr_ = other.ptr_;
+        friend bool operator==(const CommonIter &first, const CommonIter &second) {
+            return first.node_ == second.node_;
+        }
+
+        friend bool operator!=(const CommonIter &first, const CommonIter &second) {
+            return !(first == second);
+        }
+
+        pointer operator->() {
+            return &(static_cast<Node *>(node_)->value);
+        }
+
+        CommonIter &operator++() {
+            node_ = node_->next;
             return *this;
         }
 
-        MyIterator<IsConst> &operator++() {
-            ptr_ = ptr_->next;
+        CommonIter &operator--() {
+            node_ = node_->prev;
             return *this;
         }
 
-        MyIterator<IsConst> &operator--() {
-            ptr_ = ptr_->pre;
-            return *this;
-        }
-
-        MyIterator<IsConst> operator++(int) {
-            MyIterator<IsConst> copy = *this;
-            ptr_ = ptr_->next;
+        CommonIter operator++(int) {
+            CommonIter copy = *this;
+            node_ = node_->next;
             return copy;
         }
 
-        MyIterator<IsConst> operator--(int) {
-            MyIterator<IsConst> copy = *this;
-            ptr_ = ptr_->pre;
+        CommonIter operator--(int) {
+            CommonIter copy = *this;
+            node_ = node_->prev;
             return copy;
         }
 
-        std::conditional_t<IsConst, const T &, T &> operator*() {
-            return *ptr_->value;
-        }
-
-        std::conditional_t<IsConst, const T *, T *> operator->() {
-            return ptr_->value;
-        }
-
-        template<bool IsConst2>
-        bool operator==(const MyIterator<IsConst2> &other) const {
-            return ptr_ == other.ptr_;
-        }
-
-        template<bool IsConst2>
-        bool operator!=(const MyIterator<IsConst2> &other) const {
-            return !operator==(other);
-        }
+        friend class List;
     };
 
-    using Iterator = MyIterator<false>;
-    // using ConstIterator = MyIterator<true>;
+    using value_type = T;
+    using iterator = CommonIter<false>;
+    using const_iterator = CommonIter<true>;
+    using reverse_iterator = std::reverse_iterator<CommonIter<false>>;
+    using const_reverse_iterator = std::reverse_iterator<CommonIter<true>>;
 
-    // using ReverseIterator = std::reverse_iterator<MyIterator<false>>;
-    // using ConstReverseIterator = std::reverse_iterator<MyIterator<true>>;
+    iterator begin() {
+        return iterator(fake_node_.next);
+    }
 
-    List() : size_(0) {
-        fake_ = new Node(nullptr, nullptr);
-        last_ = first_ = fake_;
-    };
+    const_iterator begin() const {
+        return const_iterator(fake_node_.next);
+    }
 
-    List(const List &other) {
-        size_ = 0;
-        Node *current = other.first_;
-        fake_ = new Node(nullptr, nullptr);
-        last_ = first_ = fake_;
-        while (current != other.fake_) {
-            PushBack(*current->value);
-            current = current->next;
+    iterator end() {
+        return iterator(&fake_node_);
+    }
+
+    const_iterator end() const {
+        return const_iterator(&fake_node_);
+    }
+
+    const_iterator cbegin() const {
+        return const_iterator(fake_node_.next);
+    }
+
+    const_iterator cend() const {
+        return const_iterator(&fake_node_);
+    }
+
+    reverse_iterator rbegin() {
+        return reverse_iterator(end());
+    }
+
+    const_reverse_iterator rbegin() const {
+        return const_reverse_iterator(cend());
+    }
+
+    reverse_iterator rend() {
+        return reverse_iterator(begin());
+    }
+
+    const_reverse_iterator rend() const {
+        return const_reverse_iterator(cbegin());
+    }
+
+    const_reverse_iterator crbegin() const {
+        return const_reverse_iterator(cend());
+    }
+
+    const_reverse_iterator crend() const {
+        return const_reverse_iterator(cbegin());
+    }
+
+
+    List() = default;
+
+    List(const Alloc &alloc) : alloc_(alloc) {};
+
+    List(size_t n, const Alloc &alloc = Alloc()) : alloc_(alloc) {
+        try {
+            while (n--) {
+                emplace_(&fake_node_);
+            }
+        } catch (...) {
+            clear();
+            std::rethrow_exception(std::current_exception());
+        }
+    }
+
+    List(size_t n, const T &val, const Alloc &alloc = Alloc()) : alloc_(alloc) {
+        try {
+            while (n--) {
+                emplace_(&fake_node_, val);
+            }
+        } catch (...) {
+            clear();
+            std::rethrow_exception(std::current_exception());
+        }
+    }
+
+    void swap(List &other) {
+        std::swap(sz_, other.sz_);
+        std::swap(fake_node_, other.fake_node_);
+        std::swap(fake_node_.prev->next, other.fake_node_.prev->next);
+        std::swap(fake_node_.next->prev, other.fake_node_.next->prev);
+        std::swap(alloc_, other.alloc_);
+    }
+
+    List(const List &other) : alloc_(NodeAllocTraits::select_on_container_copy_construction(other.alloc_)) {
+        try {
+            for (auto &el: other) {
+                push_back(el);
+            }
+        } catch (...) {
+            clear();
+            std::rethrow_exception(std::current_exception());
         }
     }
 
     List(List &&other) {
-        size_ = std::move(other.size_);
-        first_ = other.first_;
-        last_ = other.last_;
-        fake_ = other.fake_;
-        Node *other_fict_node = new Node(nullptr, nullptr);
-        other.last_ = other.first_ = other.fake_ = other_fict_node;
-        other.size_ = 0;
-    }
-
-    ~List() {
-        if (size_ == 0) {
-            delete fake_;
+        if (this == &other) {
             return;
         }
-        Node *current = first_;
-        Node *next;
-        while (current != fake_) {
-            next = current->next;
-            delete current->value;
-            delete current;
-            current = next;
-        }
-        delete fake_;
-    }
-
-    void Swap(List &other) {
-        std::swap(first_, other.first_);
-        std::swap(last_, other.last_);
-        std::swap(fake_, other.fake_);
-        std::swap(size_, other.size_);
+        fake_node_.makeSwap(other.fake_node_);
+        other.fake_node_.prev = &other.fake_node_, other.fake_node_.next = &other.fake_node_;
+        sz_ = other.sz_;
+        other.sz_ = 0;
     }
 
     List &operator=(const List &other) {
+        List copy(NodeAllocTraits::propagate_on_container_copy_assignment::value ? other.alloc_ : alloc_);
+        for (auto &el: other) {
+            copy.push_back(el);
+        }
+        swap(copy);
+        return *this;
+    }
+
+    List &operator=(List &&other) noexcept {
         if (this == &other) {
             return *this;
         }
-        List copy(other);
-        Swap(copy);
+        clear();
+        if (NodeAllocTraits::propagate_on_container_move_assignment::value) {
+            alloc_ = std::move(other.alloc_);
+        }
+        fake_node_.makeSwap(other.fake_node_);
+        other.fake_node_ = BaseNode();
+        sz_ = other.sz_;
+        other.sz_ = 0;
         return *this;
     }
 
-    List &operator=(List &&other) {
-        Swap(other);
-        List empty;
-        other.Swap(empty);
-        return *this;
+    ~List() {
+        clear();
     }
 
-    bool IsEmpty() const {
-        return size_ == 0;
+    void connect(BaseNode *first, BaseNode *second) {
+        first->next = second;
+        second->prev = first;
     }
 
-    size_t Size() const {
-        return size_;
-    }
 
     template<typename U = T>
-    void PushBack(U &&element) {
-        Insert(last_, std::forward<U>(element));
+    void push_back(U &&val) {
+        emplace_(&fake_node_, std::forward<U>(val));
     }
+
 
     template<typename U = T>
-    void PushFront(U &&element) {
-        Insert(first_, std::forward<U>(element));
+    void push_front(U &&val) {
+        emplace_(fake_node_.next, std::forward<U>(val));
     }
 
-    T &Front() {
-        return *first_->value;
+    template<typename... Args>
+    void emplace_front(Args &&...args) {
+        emplace_(fake_node_.next, std::forward<Args>(args)...);
     }
 
-    T &Back() {
-        return *last_->pre->value;
+    template<typename... Args>
+    void emplace_back(Args &&...args) {
+        emplace_(&fake_node_, std::forward<Args>(args)...);
     }
 
-    const T &Front() const {
-        return *first_->value;
+    template<typename... Args>
+    void emplace(const_iterator it, Args &&...args) {
+        emplace_(it.node_, std::forward<Args>(args)...);
     }
 
-    const T &Back() const {
-        return *last_->pre->value;
+    void pop_back() {
+        erase_(fake_node_.prev);
     }
 
-    void PopBack() {
-        Erase(last_->pre);
+    void pop_front() {
+        erase_(fake_node_.next);
     }
 
-    void PopFront() {
-        Erase(first_);
+
+    iterator insert(const_iterator it, const T &val) {
+        return emplace_(it.node_, val);
     }
 
-    Iterator Begin() {
-        return Iterator(first_);
+    void erase(const_iterator it) {
+        erase_(it.node_);
     }
 
-    Iterator End() {
-        return Iterator(last_);
+    void erase(const_iterator left, const_iterator right) {
+        const_iterator it;
+        while ((it = left++) != right) {
+            erase(it);
+        }
+    }
+
+    size_t size() const {
+        return sz_;
+    }
+
+    Alloc get_allocator() const {
+        return alloc_;
+    }
+
+    void clear() {
+        while (sz_ > 0) {
+            pop_back();
+        }
+    }
+
+    T &front() {
+        return static_cast<Node *>(fake_node_.next)->value;
+    }
+
+    const T &front() const {
+        return static_cast<Node *>(fake_node_.next)->value;
+    }
+
+    T &back() {
+        return static_cast<Node *>(fake_node_.prev)->value;
+    }
+
+    const T &back() const {
+        return static_cast<Node *>(fake_node_.prev)->value;
+    }
+
+private:
+    template<typename... Args>
+    iterator emplace_(BaseNode *node, Args &&...args) {
+        Node *new_node = NodeAllocTraits::allocate(alloc_, 1);
+        BaseNode *prev = node->prev;
+        try {
+            NodeAllocTraits::construct(alloc_, new_node, std::forward<Args>(args)...);
+            connect(prev, new_node);
+            connect(new_node, node);
+            ++sz_;
+        } catch (...) {
+            NodeAllocTraits::deallocate(alloc_, new_node, 1);
+            std::rethrow_exception(std::current_exception());
+        }
+        return iterator(new_node);
+    }
+
+    void erase_(BaseNode *node) {
+        connect(node->prev, node->next);
+        NodeAllocTraits::destroy(alloc_, static_cast<Node *>(node));
+        NodeAllocTraits::deallocate(alloc_, static_cast<Node *>(node), 1);
+        --sz_;
     }
 };
-
-template<typename T>
-typename List<T>::Iterator begin(List<T> &list) {  // NOLINT
-    return list.Begin();
-}
-
-template<typename T>
-typename List<T>::Iterator end(List<T> &list) {  // NOLINT
-    return list.End();
-}
-
-// to be updated
